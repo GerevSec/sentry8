@@ -2406,6 +2406,9 @@ class QueryFields(QueryBase):
 
         name, arguments, alias = self.parse_function(match)
         snql_function = self.function_converter.get(name)
+
+        arguments = snql_function.format_as_arguments(name, arguments, self.params)
+
         if snql_function.snql_aggregate is not None:
             self.aggregates.append(snql_function.snql_aggregate(arguments, alias))
         return snql_function.snql_aggregate(arguments, alias)
@@ -2657,6 +2660,103 @@ class QueryFields(QueryBase):
         # Adding a no-op here to get the alias.
         return Function(
             "cast", [self.column("error.handled"), "Array(Nullable(UInt8))"], ERROR_HANDLED_ALIAS
+        )
+
+    def _project_threshold_multi_if_function(self) -> SelectType:
+        """Accessed by `_resolve_apdex_function` and `_resolve_count_miserable_function`,
+        this returns the right duration value (for example, lcp or duration) based
+        on project or transaction thresholds that have been configured by the user.
+        """
+
+        return Function(
+            "multiIf",
+            [
+                Function(
+                    "equals",
+                    [
+                        Function(
+                            "tupleElement",
+                            [self.resolve_field("project_threshold_config"), 1],
+                        ),
+                        "lcp",
+                    ],
+                ),
+                self.column("measurements.lcp"),
+                self.column("transaction.duration"),
+            ],
+        )
+
+    def _resolve_apdex_function(self, args: Mapping[str, str], alias: str) -> SelectType:
+        if args["satisfaction"]:
+            function_args = [self.column("transaction.duration"), int(args["satisfaction"])]
+        else:
+            function_args = [
+                self._project_threshold_multi_if_function(),
+                Function("tupleElement", [self.resolve_field("project_threshold_config"), 2]),
+            ]
+
+        return Function("apdex", function_args, alias)
+
+    def _resolve_count_miserable_function(self, args: Mapping[str, str], alias: str) -> SelectType:
+        if args["satisfaction"]:
+            lhs = self.column("transaction.duration")
+            rhs = int(args["tolerated"])
+        else:
+            lhs = self._project_threshold_multi_if_function()
+            rhs = Function(
+                "multiply",
+                [
+                    Function(
+                        "tupleElement",
+                        [self.resolve_field("project_threshold_config"), 2],
+                    ),
+                    4,
+                ],
+            )
+        col = args["column"]
+
+        return Function(
+            "uniqIf",
+            [
+                self.resolve_field_alias(col) if self.is_field_alias(col) else self.column(col),
+                Function("greater", [lhs, rhs]),
+            ],
+            alias,
+        )
+
+    def _resolve_user_misery_function(self, args: Mapping[str, str], alias: str) -> SelectType:
+        if args["satisfaction"]:
+            count_miserable_agg = self.resolve_function(
+                f"count_miserable(user,{args['satisfaction']})"
+            )
+        else:
+            count_miserable_agg = self.resolve_function("count_miserable(user)")
+
+        return Function(
+            "ifNull",
+            [
+                Function(
+                    "divide",
+                    [
+                        Function(
+                            "plus",
+                            [
+                                count_miserable_agg,
+                                args["alpha"],
+                            ],
+                        ),
+                        Function(
+                            "plus",
+                            [
+                                Function("uniq", [self.column("user")]),
+                                args["parameter_sum"],
+                            ],
+                        ),
+                    ],
+                ),
+                0,
+            ],
+            alias,
         )
 
     def _resolve_unimplemented_function(
