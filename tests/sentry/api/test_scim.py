@@ -1,7 +1,7 @@
 import pytest
 from django.urls import reverse
 
-from sentry.models import AuthProvider, OrganizationMember
+from sentry.models import AuthProvider, OrganizationMember, OrganizationMemberTeam, Team, TeamStatus
 from sentry.scim.endpoints.utils import parse_filter_conditions
 from sentry.testutils import APITestCase, TestCase
 
@@ -18,25 +18,31 @@ CREATE_USER_POST_DATA = {
     "active": True,
 }
 
+CREATE_GROUP_POST_DATA = {
+    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+    "displayName": "Test SCIMv2",
+    "members": [],
+}
 
-class SCIMUserTestsPermissions(APITestCase):
+
+class SCIMMemberTestsPermissions(APITestCase):
     def setUp(self):
         super().setUp()
         self.login_as(user=self.user)
 
     def test_cant_use_scim(self):
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(url)
         assert response.status_code == 403
 
     def test_cant_use_scim_even_with_authprovider(self):
         AuthProvider.objects.create(organization=self.organization, provider="dummy")
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(url)
         assert response.status_code == 403
 
 
-class SCIMUserTests(APITestCase):
+class SCIMMemberTests(APITestCase):
     def setUp(self):
         super().setUp()
         auth_provider = AuthProvider.objects.create(
@@ -51,7 +57,7 @@ class SCIMUserTests(APITestCase):
 
         # test OM to be created does not exist
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(
             f"{url}?startIndex=1&count=100&filter=userName%20eq%20%22test.user%40okta.local%22"
         )
@@ -101,7 +107,7 @@ class SCIMUserTests(APITestCase):
 
         # test that the OM is listed in the GET
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(
             f"{url}?startIndex=1&count=100&filter=userName%20eq%20%22test.user%40okta.local%22"
         )
@@ -127,7 +133,8 @@ class SCIMUserTests(APITestCase):
 
         # test that the OM exists when querying the id directly
         url = reverse(
-            "sentry-scim-organization-members-details", args=[self.organization.slug, org_member_id]
+            "sentry-api-0-organization-scim-member-details",
+            args=[self.organization.slug, org_member_id],
         )
         response = self.client.get(url)
         assert response.status_code == 200, response.content
@@ -144,7 +151,8 @@ class SCIMUserTests(APITestCase):
         # test that the OM is deleted after setting inactive to false
 
         url = reverse(
-            "sentry-scim-organization-members-details", args=[self.organization.slug, org_member_id]
+            "sentry-api-0-organization-scim-member-details",
+            args=[self.organization.slug, org_member_id],
         )
 
         patch_req = {
@@ -158,7 +166,7 @@ class SCIMUserTests(APITestCase):
         with pytest.raises(OrganizationMember.DoesNotExist):
             OrganizationMember.objects.get(organization=self.organization, id=org_member_id)
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(
             f"{url}?startIndex=1&count=100&filter=userName%20eq%20%22test.user%40okta.local%22"
         )
@@ -174,7 +182,8 @@ class SCIMUserTests(APITestCase):
 
         # test that directly GETing and PATCHing the deleted orgmember returns 404
         url = reverse(
-            "sentry-scim-organization-members-details", args=[self.organization.slug, org_member_id]
+            "sentry-api-0-organization-scim-member-details",
+            args=[self.organization.slug, org_member_id],
         )
 
         response = self.client.patch(url, patch_req)
@@ -191,12 +200,33 @@ class SCIMUserTests(APITestCase):
     def test_delete_route(self):
         member = self.create_member(user=self.create_user(), organization=self.organization)
         url = reverse(
-            "sentry-scim-organization-members-details", args=[self.organization.slug, member.id]
+            "sentry-api-0-organization-scim-member-details",
+            args=[self.organization.slug, member.id],
         )
         response = self.client.delete(url)
         assert response.status_code == 204, response.content
         with pytest.raises(OrganizationMember.DoesNotExist):
             OrganizationMember.objects.get(organization=self.organization, id=member.id)
+
+    def test_member_detail_patch_too_many_ops(self):
+        member = self.create_member(user=self.create_user(), organization=self.organization)
+        url = reverse(
+            "sentry-api-0-organization-scim-member-details",
+            args=[self.organization.slug, member.id],
+        )
+        response = self.client.patch(
+            url,
+            {
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": [{}] * 101,
+            },
+        )
+
+        assert response.status_code == 400, response.data
+        assert response.data == {
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+            "detail": "Too many patch ops sent, limit is 100.",
+        }
 
     # Disabling below test for now.
     # need to see what Okta admins would expect to happen with invited members
@@ -213,19 +243,19 @@ class SCIMUserTests(APITestCase):
     #     member3.invite_status = InviteStatus.APPROVED.value  # default val
     #     member3.save()
 
-    #     url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+    #     url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
     #     response = self.client.get(f"{url}?startIndex=1&count=100")
     #     assert response.status_code == 200, response.content
     #     assert response.data["totalResults"] == 2
 
     #     url = reverse(
-    #         "sentry-scim-organization-members-details", args=[self.organization.slug, member1.id]
+    #         "sentry-api-0-organization-scim-member-details", args=[self.organization.slug, member1.id]
     #     )
     #     response = self.client.get(url)
     #     assert response.status_code == 404, response.content
 
     #     url = reverse(
-    #         "sentry-scim-organization-members-details", args=[self.organization.slug, member2.id]
+    #         "sentry-api-0-organization-scim-member-details", args=[self.organization.slug, member2.id]
     #     )
     #     response = self.client.get(url)
     #     assert response.status_code == 404, response.content
@@ -233,7 +263,7 @@ class SCIMUserTests(APITestCase):
     def test_overflow_cases(self):
         member = self.create_member(user=self.create_user(), organization=self.organization)
         url = reverse(
-            "sentry-scim-organization-members-details",
+            "sentry-api-0-organization-scim-member-details",
             args=[self.organization.slug, "010101001010101011001010101011"],
         )
         response = self.client.get(
@@ -250,7 +280,7 @@ class SCIMUserTests(APITestCase):
             organization=self.organization, user_id=self.user.id
         )
         url = reverse(
-            "sentry-scim-organization-members-details",
+            "sentry-api-0-organization-scim-member-details",
             args=[self.organization.slug, member_om.id],
         )
         response = self.client.delete(url)
@@ -265,7 +295,7 @@ class SCIMUserTests(APITestCase):
             "Operations": [{"op": "replace", "value": {"active": False}}],
         }
         url = reverse(
-            "sentry-scim-organization-members-details",
+            "sentry-api-0-organization-scim-member-details",
             args=[self.organization.slug, member_om.id],
         )
         response = self.client.patch(url, patch_req)
@@ -276,21 +306,21 @@ class SCIMUserTests(APITestCase):
             user = self.create_user(is_superuser=False)
             self.create_member(user=user, organization=self.organization, role="member", teams=[])
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(f"{url}?startIndex=1&count=100")
         assert response.data["totalResults"] == 151
         assert response.data["itemsPerPage"] == 100
         assert response.data["startIndex"] == 1
         assert len(response.data["Resources"]) == 100
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(f"{url}?startIndex=40&count=100")
         assert response.data["totalResults"] == 151
         assert response.data["itemsPerPage"] == 100
         assert response.data["startIndex"] == 40
         assert len(response.data["Resources"]) == 100
 
-        url = reverse("sentry-scim-organization-members-index", args=[self.organization.slug])
+        url = reverse("sentry-api-0-organization-scim-member-index", args=[self.organization.slug])
         response = self.client.get(f"{url}?startIndex=101&count=100")
         assert len(response.data["Resources"]) == 51
         assert response.data["totalResults"] == 151
@@ -308,6 +338,12 @@ class SCIMUtilsTests(TestCase):
         # single quotes too
         fil = parse_filter_conditions("userName eq 'user@sentry.io'")
         assert fil == ["user@sentry.io"]
+
+        fil = parse_filter_conditions('value eq "23"')
+        assert fil == [23]
+
+        fil = parse_filter_conditions('displayName eq "MyTeamName"')
+        assert fil == ["MyTeamName"]
 
     def test_parse_filter_conditions_upper_to_lower(self):
         fil = parse_filter_conditions('userName eq "USER@sentry.io"')
